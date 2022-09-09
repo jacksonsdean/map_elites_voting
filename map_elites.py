@@ -1,10 +1,17 @@
 import math
 import copy
 from os import name
+import time
+from typing import Callable
 import numpy as np
 from numpy.core.fromnumeric import resize
+from cppn_neat.cppn import CPPN
+from cppn_neat.cppn import Node
+from cppn_neat.evolutionary_algorithm import EvolutionaryAlgorithm
+from cppn_neat.graph_util import name_to_fn
 from image_utils.image_utils import load_image, image_grid
 import matplotlib.pyplot as plt
+from tqdm import trange
 # from util import get_compression_size
 
 class MEMap:
@@ -16,14 +23,11 @@ class MEMap:
         self.min_cxs = config.map_elites_min_values[1]
         self.map = [[None for i in range(self.resolution[1])] for j in range(self.resolution[0])]
         self.config = config
+        self.GenomeClass = config.genome_type
         
     def add(self, individual):
         novelty = individual.novelty
         cxs = len(list(individual.enabled_connections()))
-        
-        # novelty = get_compression_size(individual.image)
-        # cxs = get_compression_size(individual.image)
-        # cxs = get_get_sbi_results_count(individual.image)
         
         novelty_percent = ((novelty-self.min_novelty)/(self.max_novelty-self.min_novelty)) if self.max_novelty -self.min_novelty >1e-3 else 0
         novelty_index = int(novelty_percent * (self.resolution[0]-1))
@@ -58,7 +62,7 @@ class MEMap:
             attempts+=1
         if output is None:
             print("Failed to find individual in map")
-            return Individual(self.config)            
+            return GenomeClass(self.config)            
             # raise Exception("Failed to find individual in map") # TODO
         return output
 
@@ -86,12 +90,6 @@ class MEMap:
     def set_max_values(self, new_maxes):
         self.max_novelty = new_maxes[0]
         self.max_cxs = new_maxes[1]
-        # old_map = copy.copy(self.map)
-        # self.map = [[None for i in range(self.resolution[1])] for j in range(self.resolution[0])] # clear map
-        # for i in range(self.resolution[0]):
-        #     for j in range(self.resolution[1]):
-        #         if(old_map[i][j]is not None):
-        #             self.add(old_map[i][j]) # re-add the individuals
     
     def show_2D_graph(self, real_values=False):
         # Xfull = range(self.resolution[0])
@@ -121,13 +119,11 @@ class MEMap:
         plt.plot(xx, yy, marker='.', color='k', markersize=3,  linestyle='none')
         plt.plot(X, Y, marker='.', color='r', markersize=12, linestyle='none')
         
-        
-        # plt.xticks(range(self.resolution[0]))
-        # plt.yticks(range(self.resolution[1]))
         plt.title ("MAP-Elites")
         plt.show()
         
         print(f"[min_cxs: {self.min_cxs}, max_cxs: {self.max_cxs}], [min_novelty: {self.min_novelty}, max_novelty: {self.max_novelty}]")
+    
     def show_3D_graph(self):
         min_fit = np.min([[self.map[i][j].fitness if self.map[i][j] is not None else math.inf for i in range(self.resolution[0])] for j in range(self.resolution[1])])
         Xfull = range(self.resolution[0])
@@ -135,11 +131,7 @@ class MEMap:
         Z = np.array([[self.map[i][j].fitness if self.map[i][j] is not None else min_fit for i in range(self.resolution[0])] for j in range(self.resolution[1])])
         
         X, Y = np.meshgrid(Xfull, Yfull)    
-        # Z = np.zeros((self.resolution[1], self.resolution[0]))
-        # for i in range( self.resolution[0]):
-        #     for j in range(self.resolution[1]):
-        #         Z[j,i] = self.map[i][j].fitness if self.map[i][j] is not None else 0 
-        
+
         ax = plt.axes(projection='3d')
         ax.plot_surface(X, Y, Z, rstride=1, cstride=1,
                 cmap='viridis', edgecolor='none')
@@ -155,4 +147,76 @@ class MEMap:
         blank_img = np.ones(example_image.shape)
         images = np.array([[self.map[i][j].get_image() if self.map[i][j] is not None else blank_img for i in range(self.resolution[0])] for j in range(self.resolution[1])])
         image_grid(images, color_mode, "Novelty", "Connections")
+        
+class MAPElites(EvolutionaryAlgorithm):
+    def __init__(self, target, config, debug_output=False, genome_type=CPPN) -> None:
+        self.gen = 0
+        self.next_available_id = 0
+        self.debug_output = debug_output
+        self.all_species = []
+        self.config = config
+        Node.current_id =  self.config.num_inputs + self.config.num_outputs # reset node id counter
+        self.show_output = True
+        
+        self.diversity_over_time = np.zeros(self.config.num_generations,dtype=float)
+        self.population_over_time = np.zeros(self.config.num_generations,dtype=np.uint8)
+        self.species_over_time = np.zeros(self.config.num_generations,dtype=np.float)
+        self.species_threshold_over_time = np.zeros(self.config.num_generations, dtype=np.float)
+        self.nodes_over_time = np.zeros(self.config.num_generations, dtype=np.float)
+        self.connections_over_time = np.zeros(self.config.num_generations, dtype=np.float)
+        self.fitness_over_time = np.zeros(self.config.num_generations, dtype=np.float)
+        self.species_pops_over_time = []
+        self.solutions_over_time = []
+        self.species_champs_over_time = []
+        self.time_elapsed = 0
+        self.solution_generation = -1
+        self.species_threshold = self.config.init_species_threshold
+        self.population = []
+        self.solution = None
+        
+        self.solution_fitness = -math.inf
+        self.best_genome = None
+
+        self.genome_type = genome_type
+        
+        self.fitness_function = config.fitness_function
+
+
+        self.me_map = MEMap(self.config)
+        
+        if not isinstance(config.fitness_function, Callable):
+            self.fitness_function = name_to_fn(config.fitness_function)
+        self.fitness_function_normed = self.fitness_function
+    
+        self.target = target
+    
+    
+    def evolve(self, run_number=1, show_output=True):
+        self.start_time = time.time()
+        try:
+            self.run_number = run_number
+            self.show_output = show_output or self.debug_output
+            for i in range(self.config.population_size): # only create parents for initialization (the mu in mu+lambda)
+                self.population.append(self.genome_type(self.config)) # generate new random individuals as parents
+            
+            # Run algorithm
+            pbar = trange(self.config.num_generations, desc=f"Run {self.run_number}")
+            self.update_fitnesses_and_novelty()
+            self.population = sorted(self.population, key=lambda x: x.fitness, reverse=True) # sort by fitness
+            self.solution = self.population[0]
+            
+            for self.gen in pbar:
+                self.run_one_generation()
+                pbar.set_postfix_str(f"f: {self.get_best().fitness:.4f} d:{self.diversity_over_time[self.gen-1]:.4f}")
+        except KeyboardInterrupt:
+            raise KeyboardInterrupt()  
+        self.end_time = time.time()     
+        self.time_elapsed = self.end_time - self.start_time  
+        
+    def run_one_generation(self):
+        if self.show_output:
+            self.print_fitnesses()
+        self.update_fitnesses_and_novelty()
+        for g in self.population:
+            self.me_map.add(g) # selection procedure
         
